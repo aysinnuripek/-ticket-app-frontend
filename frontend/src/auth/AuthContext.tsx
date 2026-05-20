@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useState } from "react"
+import { createContext, useContext, useState } from "react"
 
 type User = {
   email: string
@@ -15,19 +15,26 @@ type AuthContextType = {
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined)
 
-export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const [user, setUser] = useState<User | null>(null)
-  const [idToken, setIdToken] = useState<string | null>(null)
-
-  useEffect(() => {
+function readStoredUser(): User | null {
+  try {
     const storedUser = localStorage.getItem("user")
     const storedToken = localStorage.getItem("idToken")
+    if (!storedUser || !storedToken) return null
+    return JSON.parse(storedUser) as User
+  } catch {
+    return null
+  }
+}
 
-    if (storedUser && storedToken) {
-      setUser(JSON.parse(storedUser))
-      setIdToken(storedToken)
-    }
-  }, [])
+function readStoredToken(): string | null {
+  const storedUser = localStorage.getItem("user")
+  const storedToken = localStorage.getItem("idToken")
+  return storedUser && storedToken ? storedToken : null
+}
+
+export function AuthProvider({ children }: { children: React.ReactNode }) {
+  const [user, setUser] = useState<User | null>(() => readStoredUser())
+  const [idToken, setIdToken] = useState<string | null>(() => readStoredToken())
 
   function saveSession(newUser: User) {
     const fakeToken = "temporary-demo-token"

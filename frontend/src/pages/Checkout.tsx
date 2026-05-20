@@ -1,19 +1,11 @@
 import { useState } from "react"
-import { Link, useNavigate, useSearchParams } from "react-router-dom"
+import { Link, useSearchParams } from "react-router-dom"
 import TicketTypeRow from "../components/TicketTypeRow"
 import { events } from "../data/events"
-
-type SavedTicket = {
-  id: string
-  eventTitle: string
-  generalQuantity: number
-  vipQuantity: number
-  total: number
-  purchasedAt: string
-}
+import { createOrder } from "../api/orders"
+import type { OrderItem } from "../api/orders"
 
 export default function Checkout() {
-  const navigate = useNavigate()
   const [searchParams] = useSearchParams()
 
   const eventId = searchParams.get("eventId")
@@ -21,6 +13,8 @@ export default function Checkout() {
 
   const [generalQuantity, setGeneralQuantity] = useState(1)
   const [vipQuantity, setVipQuantity] = useState(0)
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState("")
 
   if (!selectedEvent) {
     return (
@@ -48,24 +42,38 @@ export default function Checkout() {
   const vipPrice = event.price * 2
   const total = generalQuantity * generalPrice + vipQuantity * vipPrice
 
-  function handlePay() {
-    if (total === 0) {
+  async function handlePay() {
+    if (total === 0 || submitting) {
       return
     }
 
-    const newTicket: SavedTicket = {
-      id: `TICKET-${Math.random().toString(36).slice(2, 10).toUpperCase()}`,
-      eventTitle: event.title,
-      generalQuantity,
-      vipQuantity,
-      total,
-      purchasedAt: new Date().toISOString(),
+    setSubmitting(true)
+    setError("")
+
+    const items: OrderItem[] = []
+    if (generalQuantity > 0) {
+      items.push({
+        name: `${event.title} — General Admission`,
+        unit_price_cents: generalPrice * 100,
+        quantity: generalQuantity,
+      })
+    }
+    if (vipQuantity > 0) {
+      items.push({
+        name: `${event.title} — VIP`,
+        unit_price_cents: vipPrice * 100,
+        quantity: vipQuantity,
+      })
     }
 
-    const existingTickets = JSON.parse(localStorage.getItem("tickets") || "[]")
-    localStorage.setItem("tickets", JSON.stringify([newTicket, ...existingTickets]))
-
-    navigate("/checkout/success")
+    try {
+      const { checkout_url } = await createOrder({ items })
+      window.location.href = checkout_url
+    } catch (err) {
+      console.error(err)
+      setError("Could not start payment. Is the backend running on :8000?")
+      setSubmitting(false)
+    }
   }
 
   return (
@@ -82,6 +90,12 @@ export default function Checkout() {
         You are buying tickets for{" "}
         <span className="font-semibold text-slate-900">{event.title}</span>.
       </p>
+
+      {error && (
+        <div className="mt-5 rounded-xl bg-red-50 p-4 text-sm text-red-700">
+          {error}
+        </div>
+      )}
 
       <section className="mt-8 space-y-4">
         <TicketTypeRow
@@ -109,10 +123,10 @@ export default function Checkout() {
 
         <button
           onClick={handlePay}
-          disabled={total === 0}
+          disabled={total === 0 || submitting}
           className="mt-6 w-full rounded-xl bg-slate-900 px-5 py-3 font-semibold text-white hover:bg-slate-700 disabled:cursor-not-allowed disabled:bg-slate-300"
         >
-          Continue to payment
+          {submitting ? "Redirecting to Stripe..." : "Continue to payment"}
         </button>
       </section>
     </main>
