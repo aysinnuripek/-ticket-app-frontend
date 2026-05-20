@@ -34,3 +34,7 @@ venv/
 
 # LocalStack state
 .localstack/
+
+# Playwright artifacts
+test-results/
+playwright-report/

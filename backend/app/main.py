@@ -37,6 +37,31 @@ def _send_order_confirmation(order: dict) -> None:
     email_templates.send_via_ses(ses_client, SES_FROM, SES_DEMO_TO, subject, html, text)
     print(f"[ses] order_confirmation sent for {order['id']}")
 
+
+def _complete_order(order: dict) -> None:
+    """Idempotent post-payment work: mark paid, email confirmation, enqueue SQS.
+
+    Called by the Stripe webhook AND by the /test/complete-order test endpoint.
+    """
+    if order["status"] == "paid":
+        return
+    order["status"] = "paid"
+    print(f"[order] {order['id']} marked paid")
+
+    try:
+        _send_order_confirmation(order)
+    except Exception as e:
+        print(f"[ses] order_confirmation FAILED: {e}")
+
+    if sqs_client and SQS_QUEUE_URL:
+        sqs_client.send_message(
+            QueueUrl=SQS_QUEUE_URL,
+            MessageBody=json.dumps({"order": order}),
+        )
+        print(f"[order] enqueued {order['id']} on SQS")
+    else:
+        print("[order] SQS not configured — skipping enqueue")
+
 app = FastAPI(title="Ticket App API (Member D scaffold)")
 
 app.add_middleware(
@@ -125,21 +150,23 @@ async def stripe_webhook(request: Request):
         order_id = event["data"]["object"]["metadata"]["order_id"]
         order = ORDERS.get(order_id)
         if order:
-            order["status"] = "paid"
-            print(f"[stripe] order {order_id} marked paid")
-
-            try:
-                _send_order_confirmation(order)
-            except Exception as e:
-                print(f"[ses] order_confirmation FAILED: {e}")
-
-            if sqs_client and SQS_QUEUE_URL:
-                sqs_client.send_message(
-                    QueueUrl=SQS_QUEUE_URL,
-                    MessageBody=json.dumps({"order": order}),
-                )
-                print(f"[stripe] enqueued order {order_id} on SQS")
-            else:
-                print("[stripe] SQS not configured — skipping enqueue")
+            _complete_order(order)
 
     return {"received": True}
+
+
+# ---------------------------------------------------------------------------
+# Test-only endpoint: synthesize a successful payment without going to Stripe.
+# Enabled only when TEST_MODE=true in the environment. Used by Playwright to
+# avoid testing Stripe's own checkout UI (which Stripe redesigns frequently).
+# ---------------------------------------------------------------------------
+if os.environ.get("TEST_MODE", "").lower() == "true":
+    @app.post("/test/complete-order/{order_id}")
+    def test_complete_order(order_id: str):
+        order = ORDERS.get(order_id)
+        if not order:
+            raise HTTPException(404, "Order not found")
+        _complete_order(order)
+        return {"order_id": order_id, "status": order["status"]}
+
+    print("[main] TEST_MODE enabled — /test/complete-order/{id} available")
