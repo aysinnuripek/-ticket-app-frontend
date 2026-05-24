@@ -1,11 +1,30 @@
 import { useEffect, useState } from "react"
 import { Link, useParams } from "react-router-dom"
 import { getEvent } from "../api/events"
-import type { EventItem } from "../data/events"
+
+type TicketType = {
+  id: string
+  name: string
+  price_cents: number
+  total_quantity: number
+  sold_quantity: number
+}
+
+type DetailedEvent = {
+  id: string
+  title: string
+  city: string
+  category: string
+  date: string
+  price: number
+  imageUrl: string
+  description: string
+  ticketTypes: TicketType[]
+}
 
 export default function EventDetail() {
   const { id } = useParams()
-  const [event, setEvent] = useState<EventItem | null>(null)
+  const [event, setEvent] = useState<DetailedEvent | null>(null)
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
@@ -21,6 +40,7 @@ export default function EventDetail() {
           price: data.price,
           imageUrl: data.image_url,
           description: data.description,
+          ticketTypes: data.ticket_types || [],
         })
         setLoading(false)
       })
@@ -63,7 +83,7 @@ export default function EventDetail() {
         />
 
         <div className="p-6">
-          <p className="text-sm text-slate-500">
+          <p className="text-slate-500 text-sm">
             {event.city} • {event.category} • {event.date}
           </p>
 
@@ -75,17 +95,38 @@ export default function EventDetail() {
             {event.description}
           </p>
 
-          <div className="mt-8 rounded-xl border border-slate-200 p-5">
-            <h2 className="text-xl font-semibold">General Admission</h2>
-            <p className="mt-2 text-slate-600">Available tickets: 100</p>
-            <p className="mt-2 text-lg font-bold">₺{event.price}</p>
+          <div className="mt-8 space-y-4">
+            <h3 className="text-xl font-bold text-slate-900">Tickets</h3>
+            {event.ticketTypes.map((tt) => {
+              const available = tt.total_quantity - tt.sold_quantity
+              const isSoldOut = available <= 0
 
-            <Link
-              to={`/checkout?eventId=${event.id}`}
-              className="mt-5 inline-block rounded-xl bg-slate-900 px-5 py-3 text-white hover:bg-slate-700"
-            >
-              Select ticket
-            </Link>
+              return (
+                <div key={tt.id} className="rounded-xl border border-slate-200 p-5 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 bg-slate-50/50">
+                  <div>
+                    <h4 className="text-lg font-semibold text-slate-800">{tt.name}</h4>
+                    <p className={`mt-1 text-sm ${isSoldOut ? "text-red-600 font-semibold" : "text-slate-500"}`}>
+                      {isSoldOut ? "Sold Out" : `Available tickets: ${available}`}
+                    </p>
+                    <p className="mt-1 text-lg font-bold text-slate-900">₺{tt.price_cents / 100}</p>
+                  </div>
+
+                  {!isSoldOut && (
+                    <Link
+                      to={`/checkout?eventId=${event.id}`}
+                      className="rounded-xl bg-slate-900 px-5 py-3 text-white hover:bg-slate-700 font-semibold text-center"
+                    >
+                      Select ticket
+                    </Link>
+                  )}
+                  {isSoldOut && (
+                    <span className="rounded-xl bg-red-50 border border-red-200 px-5 py-3 text-red-700 font-semibold cursor-not-allowed text-center">
+                      Sold Out
+                    </span>
+                  )}
+                </div>
+              )
+            })}
           </div>
         </div>
       </div>
