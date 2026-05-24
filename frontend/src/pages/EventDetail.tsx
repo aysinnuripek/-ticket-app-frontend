@@ -101,12 +101,26 @@ export default function EventDetail() {
               const available = tt.total_quantity - tt.sold_quantity
               const isSoldOut = available <= 0
 
+              let availabilityText = `Available tickets: ${available}`
+              let availabilityColorClass = "text-slate-500"
+
+              if (isSoldOut) {
+                availabilityText = "Sold Out"
+                availabilityColorClass = "text-red-600 font-semibold"
+              } else if (available === 1) {
+                availabilityText = "Last 1 ticket!"
+                availabilityColorClass = "text-amber-600 font-semibold"
+              } else if (available <= 3) {
+                availabilityText = `Last ${available} tickets!`
+                availabilityColorClass = "text-amber-600 font-semibold"
+              }
+
               return (
                 <div key={tt.id} className="rounded-xl border border-slate-200 p-5 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 bg-slate-50/50">
                   <div>
                     <h4 className="text-lg font-semibold text-slate-800">{tt.name}</h4>
-                    <p className={`mt-1 text-sm ${isSoldOut ? "text-red-600 font-semibold" : "text-slate-500"}`}>
-                      {isSoldOut ? "Sold Out" : `Available tickets: ${available}`}
+                    <p className={`mt-1 text-sm ${availabilityColorClass}`}>
+                      {availabilityText}
                     </p>
                     <p className="mt-1 text-lg font-bold text-slate-900">₺{tt.price_cents / 100}</p>
                   </div>
