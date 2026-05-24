@@ -38,3 +38,7 @@ venv/
 # Playwright artifacts
 test-results/
 playwright-report/
+
+# Local DB data
+.postgres/
+.redis/

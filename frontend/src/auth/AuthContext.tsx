@@ -3,6 +3,7 @@ import { createContext, useContext, useState } from "react"
 type User = {
   email: string
   fullName?: string
+  role?: string
 }
 
 type AuthContextType = {
@@ -37,12 +38,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [idToken, setIdToken] = useState<string | null>(() => readStoredToken())
 
   function saveSession(newUser: User) {
-    const fakeToken = "temporary-demo-token"
+    const role = newUser.email === "organizer@example.com" ? "organizer" : "customer"
+    const fakeToken = `test-token-${newUser.email}-${role}`
+    const userWithRole = { ...newUser, role }
 
-    localStorage.setItem("user", JSON.stringify(newUser))
+    localStorage.setItem("user", JSON.stringify(userWithRole))
     localStorage.setItem("idToken", fakeToken)
 
-    setUser(newUser)
+    setUser(userWithRole)
     setIdToken(fakeToken)
   }
 

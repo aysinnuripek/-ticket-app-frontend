@@ -1,5 +1,9 @@
+import { useEffect, useState } from "react"
 import { Link } from "react-router-dom"
 import TicketQRCode from "../components/TicketQRCode"
+import { apiClient } from "../api/client"
+
+import { useAuth } from "../auth/AuthContext"
 
 type SavedTicket = {
   id: string
@@ -11,7 +15,51 @@ type SavedTicket = {
 }
 
 export default function MyTickets() {
-  const tickets: SavedTicket[] = JSON.parse(localStorage.getItem("tickets") || "[]")
+  const { user } = useAuth()
+  const [tickets, setTickets] = useState<SavedTicket[]>([])
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    apiClient
+      .get<SavedTicket[]>("/orders/me")
+      .then((res) => {
+        setTickets(res.data)
+        setLoading(false)
+      })
+      .catch((err) => {
+        console.error(err)
+        setLoading(false)
+      })
+  }, [])
+
+  async function handleDownload(orderId: string) {
+    try {
+      const res = await apiClient.get<{ download_url: string }>(`/tickets/${orderId}`)
+      window.open(res.data.download_url, "_blank")
+    } catch (err) {
+      console.error(err)
+      alert("Failed to download PDF ticket. Make sure the SQS worker generated it.")
+    }
+  }
+
+  if (user && (user.role === "organizer" || user.role === "admin" || user.email === "organizer@example.com")) {
+    return (
+      <main className="mx-auto max-w-4xl px-6 py-10">
+        <h1 className="text-3xl font-bold text-slate-900">Access Denied</h1>
+        <p className="mt-3 text-slate-600">
+          Organizers and admins do not have ticket purchase profiles.
+        </p>
+      </main>
+    )
+  }
+
+  if (loading) {
+    return (
+      <main className="mx-auto max-w-4xl px-6 py-10">
+        <p className="text-slate-600">Loading tickets...</p>
+      </main>
+    )
+  }
 
   return (
     <main className="mx-auto max-w-4xl px-6 py-10">
@@ -74,7 +122,7 @@ export default function MyTickets() {
                   </p>
 
                   <button
-                    onClick={() => alert("PDF download will be connected after backend/Lambda is ready.")}
+                    onClick={() => handleDownload(ticket.id)}
                     className="mt-4 rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-700"
                   >
                     Download ticket

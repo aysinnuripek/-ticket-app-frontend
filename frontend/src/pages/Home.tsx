@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react"
 import EventCard from "../components/EventCard"
-import { getStoredEvents } from "../data/eventStore"
+import { getEvents } from "../api/events"
 import type { EventItem } from "../data/events"
 
 function normalizeText(value: string) {
@@ -55,7 +55,21 @@ export default function Home() {
   const [selectedCategory, setSelectedCategory] = useState("All")
 
   useEffect(() => {
-    setEventList(getStoredEvents())
+    getEvents()
+      .then((data) => {
+        const mapped = data.map((item: any) => ({
+          id: item.id,
+          title: item.title,
+          city: item.city,
+          category: item.category,
+          date: item.starts_at,
+          price: item.price,
+          imageUrl: item.image_url,
+          description: item.description,
+        }))
+        setEventList(mapped)
+      })
+      .catch((err) => console.error("Failed to load events", err))
   }, [])
 
   const cities = useMemo(() => {

@@ -91,15 +91,26 @@ def _send_email(to_address: str, order: dict, download_url: str) -> None:
 
 def process_message(body: dict) -> None:
     order = body["order"]
-    # one ticket per quantity-1 unit; for demo we generate one ticket per order item.
-    for item in order["items"]:
-        for _ in range(item["quantity"]):
-            ticket_id = str(uuid.uuid4())
+    tickets = order.get("tickets")
+    if tickets:
+        # Use pre-generated tickets from the database
+        for ticket in tickets:
+            ticket_id = ticket["id"]
             pdf_bytes = _build_pdf(ticket_id, order)
             key = _upload_pdf(ticket_id, pdf_bytes)
             url = _signed_url(key)
             _send_email(SES_DEMO_TO, order, url)
             print(f"  → ticket {ticket_id} → s3://{BUCKET}/{key}")
+    else:
+        # Fallback: one ticket per quantity-1 unit if not pre-generated
+        for item in order["items"]:
+            for _ in range(item["quantity"]):
+                ticket_id = str(uuid.uuid4())
+                pdf_bytes = _build_pdf(ticket_id, order)
+                key = _upload_pdf(ticket_id, pdf_bytes)
+                url = _signed_url(key)
+                _send_email(SES_DEMO_TO, order, url)
+                print(f"  → ticket {ticket_id} → s3://{BUCKET}/{key}")
 
 
 def handler(event, _context=None):

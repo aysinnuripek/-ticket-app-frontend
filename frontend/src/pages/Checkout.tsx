@@ -1,7 +1,8 @@
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import { Link, useSearchParams } from "react-router-dom"
 import TicketTypeRow from "../components/TicketTypeRow"
-import { events } from "../data/events"
+import { getEvent } from "../api/events"
+import type { EventItem } from "../data/events"
 import { createOrder } from "../api/orders"
 import type { OrderItem } from "../api/orders"
 
@@ -9,12 +10,46 @@ export default function Checkout() {
   const [searchParams] = useSearchParams()
 
   const eventId = searchParams.get("eventId")
-  const selectedEvent = events.find((item) => item.id === eventId)
+  const [selectedEvent, setSelectedEvent] = useState<EventItem | null>(null)
+  const [loading, setLoading] = useState(true)
 
   const [generalQuantity, setGeneralQuantity] = useState(1)
   const [vipQuantity, setVipQuantity] = useState(0)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState("")
+
+  useEffect(() => {
+    if (!eventId) {
+      setLoading(false)
+      return
+    }
+    getEvent(eventId)
+      .then((data: any) => {
+        setSelectedEvent({
+          id: data.id,
+          title: data.title,
+          city: data.city,
+          category: data.category,
+          date: data.starts_at,
+          price: data.price,
+          imageUrl: data.image_url,
+          description: data.description,
+        })
+        setLoading(false)
+      })
+      .catch((err) => {
+        console.error(err)
+        setLoading(false)
+      })
+  }, [eventId])
+
+  if (loading) {
+    return (
+      <main className="mx-auto max-w-3xl px-6 py-10">
+        <p className="text-slate-600">Loading checkout details...</p>
+      </main>
+    )
+  }
 
   if (!selectedEvent) {
     return (
@@ -69,9 +104,10 @@ export default function Checkout() {
     try {
       const { checkout_url } = await createOrder({ items })
       window.location.href = checkout_url
-    } catch (err) {
+    } catch (err: any) {
       console.error(err)
-      setError("Could not start payment. Is the backend running on :8000?")
+      const msg = err.response?.data?.detail || "Could not start payment. Is the backend running on :8000?"
+      setError(msg)
       setSubmitting(false)
     }
   }

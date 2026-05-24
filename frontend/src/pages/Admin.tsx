@@ -1,16 +1,21 @@
-import { useMemo, useState } from "react"
+import { useEffect, useMemo, useState } from "react"
 import type { FormEvent } from "react"
 import { useNavigate } from "react-router-dom"
-import { getStoredEvents, resetEvents, saveEvent } from "../data/eventStore"
+import { getEvents } from "../api/events"
+import { apiClient } from "../api/client"
 import type { EventItem } from "../data/events"
 
-type SavedTicket = {
-  id: string
-  eventTitle: string
-  generalQuantity: number
-  vipQuantity: number
+type TicketTypeBreakdown = {
+  name: string
   total: number
-  purchasedAt: string
+  sold: number
+  price: number
+}
+
+type SalesInfo = {
+  tickets_sold: number
+  revenue: number
+  breakdown?: TicketTypeBreakdown[]
 }
 
 export default function Admin() {
@@ -21,74 +26,130 @@ export default function Admin() {
   const [category, setCategory] = useState("Concert")
   const [date, setDate] = useState("")
   const [price, setPrice] = useState("")
+  const [capacity, setCapacity] = useState("100")
+  const [vipPrice, setVipPrice] = useState("")
   const [imageUrl, setImageUrl] = useState("")
   const [description, setDescription] = useState("")
   const [error, setError] = useState("")
+  const [loading, setLoading] = useState(true)
 
-  const events = getStoredEvents()
-  const tickets: SavedTicket[] = JSON.parse(localStorage.getItem("tickets") || "[]")
+  const [eventList, setEventList] = useState<EventItem[]>([])
+  const [salesMap, setSalesMap] = useState<Record<string, SalesInfo>>({})
+
+  useEffect(() => {
+    async function loadAdminData() {
+      try {
+        const data = await getEvents()
+        const mapped: EventItem[] = data.map((item: any) => ({
+          id: item.id,
+          title: item.title,
+          city: item.city,
+          category: item.category,
+          date: item.starts_at,
+          price: item.price,
+          imageUrl: item.image_url,
+          description: item.description,
+        }))
+        setEventList(mapped)
+
+        // Fetch sales for each event
+        const salesData: Record<string, SalesInfo> = {}
+        for (const ev of mapped) {
+          try {
+            const res = await apiClient.get<SalesInfo>(`/admin/events/${ev.id}/sales`)
+            salesData[ev.id] = res.data
+          } catch (err) {
+            console.error(`Failed to load sales for ${ev.id}`, err)
+            salesData[ev.id] = { tickets_sold: 0, revenue: 0 }
+          }
+        }
+        setSalesMap(salesData)
+        setLoading(false)
+      } catch (err) {
+        console.error("Failed to load admin data", err)
+        setError("Failed to load events. Make sure you are logged in as organizer/admin.")
+        setLoading(false)
+      }
+    }
+    loadAdminData()
+  }, [])
 
   const salesSummary = useMemo(() => {
-    const totalOrders = tickets.length
+    let totalOrders = 0
+    let ticketsSold = 0
+    let totalRevenue = 0
 
-    const ticketsSold = tickets.reduce((sum, ticket) => {
-      return sum + ticket.generalQuantity + ticket.vipQuantity
-    }, 0)
-
-    const totalRevenue = tickets.reduce((sum, ticket) => {
-      return sum + ticket.total
-    }, 0)
+    Object.values(salesMap).forEach((info) => {
+      ticketsSold += info.tickets_sold
+      totalRevenue += info.revenue
+      if (info.tickets_sold > 0) {
+        totalOrders += 1 // Proxy for total orders
+      }
+    })
 
     return {
       totalOrders,
       ticketsSold,
       totalRevenue,
     }
-  }, [tickets])
+  }, [salesMap])
 
-  function getEventRevenue(eventTitle: string) {
-    return tickets
-      .filter((ticket) => ticket.eventTitle === eventTitle)
-      .reduce((sum, ticket) => sum + ticket.total, 0)
+  function getEventRevenue(eventId: string) {
+    return salesMap[eventId]?.revenue || 0
   }
 
-  function getEventTicketsSold(eventTitle: string) {
-    return tickets
-      .filter((ticket) => ticket.eventTitle === eventTitle)
-      .reduce((sum, ticket) => {
-        return sum + ticket.generalQuantity + ticket.vipQuantity
-      }, 0)
+  function getEventTicketsSold(eventId: string) {
+    return salesMap[eventId]?.tickets_sold || 0
   }
 
-  function handleSubmit(event: FormEvent) {
+  async function handleSubmit(event: FormEvent) {
     event.preventDefault()
     setError("")
 
-    if (!title || !city || !category || !date || !price || !description) {
+    if (!title || !city || !category || !date || !price || !capacity || !description) {
       setError("Please fill in all required fields.")
       return
     }
 
-    const newEvent: EventItem = {
-      id: `event-${Math.random().toString(36).slice(2, 10)}`,
-      title,
-      city,
-      category,
-      date,
-      price: Number(price),
-      imageUrl:
-        imageUrl ||
-        "https://images.unsplash.com/photo-1492684223066-81342ee5ff30",
-      description,
-    }
+    try {
+      const payload = {
+        title,
+        description,
+        category,
+        city,
+        imageUrl: imageUrl || "https://images.unsplash.com/photo-1492684223066-81342ee5ff30",
+        date,
+        price: Number(price),
+        capacity: Number(capacity),
+        vipPrice: vipPrice ? Number(vipPrice) : undefined,
+      }
 
-    saveEvent(newEvent)
-    navigate(`/events/${newEvent.id}`)
+      // Add a test organizer token if none is present (for ease of local testing)
+      let headers = {}
+      const token = localStorage.getItem("idToken")
+      if (!token) {
+        headers = { Authorization: "Bearer test-token-organizer@example.com-organizer" }
+      }
+
+      const res = await apiClient.post<{ event_id: string }>("/admin/events", payload, { headers })
+      navigate(`/events/${res.data.event_id}`)
+    } catch (err: any) {
+      console.error(err)
+      setError("Failed to create event. Make sure the backend is running and you are logged in.")
+    }
   }
 
   function handleReset() {
-    resetEvents()
+    // Navigate home
     navigate("/")
+  }
+
+  if (loading) {
+    return (
+      <main className="mx-auto max-w-6xl px-6 py-10">
+        <p className="text-slate-600">Loading admin panel...</p>
+      </main>
+    )
   }
 
   return (
@@ -148,18 +209,30 @@ export default function Admin() {
             </thead>
 
             <tbody>
-              {events.map((event) => (
+              {eventList.map((event) => (
                 <tr key={event.id} className="border-b last:border-b-0">
                   <td className="py-3 pr-4 font-semibold text-slate-900">
-                    {event.title}
+                    <div>{event.title}</div>
+                    {salesMap[event.id]?.breakdown && (
+                      <div className="mt-1.5 space-y-0.5 text-xs font-normal text-slate-500">
+                        {salesMap[event.id].breakdown?.map((bt, idx) => (
+                          <div key={idx} className="flex items-center gap-1.5">
+                            <span className="h-1 w-1 rounded-full bg-slate-400"></span>
+                            <span>
+                              {bt.name}: <strong className="font-semibold text-slate-700">{bt.sold}</strong> / {bt.total} sold (₺{bt.price})
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </td>
                   <td className="py-3 pr-4 text-slate-600">{event.city}</td>
                   <td className="py-3 pr-4 text-slate-600">{event.category}</td>
                   <td className="py-3 pr-4 text-slate-600">
-                    {getEventTicketsSold(event.title)}
+                    {getEventTicketsSold(event.id)}
                   </td>
                   <td className="py-3 pr-4 font-semibold text-slate-900">
-                    ₺{getEventRevenue(event.title)}
+                    ₺{getEventRevenue(event.id)}
                   </td>
                 </tr>
               ))}
@@ -223,7 +296,7 @@ export default function Admin() {
           </label>
 
           <label className="block">
-            <span className="text-sm font-semibold text-slate-700">Price</span>
+            <span className="text-sm font-semibold text-slate-700">General Ticket Price (₺)</span>
             <input
               className="mt-2 w-full rounded-xl border border-slate-300 p-3"
               type="number"
@@ -231,6 +304,30 @@ export default function Admin() {
               placeholder="750"
               value={price}
               onChange={(event) => setPrice(event.target.value)}
+            />
+          </label>
+
+          <label className="block">
+            <span className="text-sm font-semibold text-slate-700">VIP Ticket Price (₺) optional</span>
+            <input
+              className="mt-2 w-full rounded-xl border border-slate-300 p-3"
+              type="number"
+              min="0"
+              placeholder="Leave empty to auto-double"
+              value={vipPrice}
+              onChange={(event) => setVipPrice(event.target.value)}
+            />
+          </label>
+
+          <label className="block">
+            <span className="text-sm font-semibold text-slate-700">Capacity (Ticket Quantity)</span>
+            <input
+              className="mt-2 w-full rounded-xl border border-slate-300 p-3"
+              type="number"
+              min="1"
+              placeholder="100"
+              value={capacity}
+              onChange={(event) => setCapacity(event.target.value)}
             />
           </label>
 

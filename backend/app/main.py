@@ -1,3 +1,4 @@
+import datetime
 import json
 import os
 import uuid
@@ -6,14 +7,32 @@ from typing import Literal
 import boto3
 import stripe
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
 load_dotenv()
 
-from app.stripe_service import create_checkout_session  # noqa: E402
 from app import email_templates  # noqa: E402
+from app.auth import get_current_user, require_role  # noqa: E402
+from app.database import get_db  # noqa: E402
+from app.models import (  # noqa: E402
+    Event,
+    Order,
+    OrderItem,
+    ProcessedStripeEvent,
+    Ticket,
+    TicketType,
+    User,
+    Venue,
+)
+from app.redis_client import (  # noqa: E402
+    redis_client,
+    release_tickets,
+    reserve_tickets,
+)
+from app.stripe_service import create_checkout_session  # noqa: E402
 
 AWS_ENDPOINT_URL = os.environ.get("AWS_ENDPOINT_URL") or None
 AWS_REGION = os.environ.get("AWS_DEFAULT_REGION", "eu-central-1")
@@ -21,48 +40,93 @@ SQS_QUEUE_URL = os.environ.get("SQS_QUEUE_URL")
 SES_FROM = os.environ.get("SES_FROM_ADDRESS")
 SES_DEMO_TO = os.environ.get("SES_DEMO_TO_ADDRESS")
 
-sqs_client = boto3.client(
-    "sqs", endpoint_url=AWS_ENDPOINT_URL, region_name=AWS_REGION
-) if SQS_QUEUE_URL else None
+sqs_client = (
+    boto3.client("sqs", endpoint_url=AWS_ENDPOINT_URL, region_name=AWS_REGION)
+    if SQS_QUEUE_URL
+    else None
+)
 
-ses_client = boto3.client(
-    "ses", endpoint_url=AWS_ENDPOINT_URL, region_name=AWS_REGION
-) if SES_FROM else None
+ses_client = (
+    boto3.client("ses", endpoint_url=AWS_ENDPOINT_URL, region_name=AWS_REGION)
+    if SES_FROM
+    else None
+)
+
+s3_client = boto3.client(
+    "s3", endpoint_url=AWS_ENDPOINT_URL, region_name=AWS_REGION
+)
 
 
-def _send_order_confirmation(order: dict) -> None:
+def _send_order_confirmation(order_dict: dict) -> None:
     if not (ses_client and SES_FROM and SES_DEMO_TO):
         return
-    subject, html, text = email_templates.order_confirmation(order)
-    email_templates.send_via_ses(ses_client, SES_FROM, SES_DEMO_TO, subject, html, text)
-    print(f"[ses] order_confirmation sent for {order['id']}")
+    subject, html, text = email_templates.order_confirmation(order_dict)
+    email_templates.send_via_ses(
+        ses_client, SES_FROM, SES_DEMO_TO, subject, html, text
+    )
+    print(f"[ses] order_confirmation sent for {order_dict['id']}")
 
 
-def _complete_order(order: dict) -> None:
-    """Idempotent post-payment work: mark paid, email confirmation, enqueue SQS.
-
-    Called by the Stripe webhook AND by the /test/complete-order test endpoint.
-    """
-    if order["status"] == "paid":
+def _complete_order(order: Order, db: Session) -> None:
+    """Idempotent post-payment work: mark paid, email confirmation, enqueue SQS."""
+    if order.status == "paid":
         return
-    order["status"] = "paid"
-    print(f"[order] {order['id']} marked paid")
+
+    order.status = "paid"
+    db.commit()
+    print(f"[order] {order.id} marked paid in DB")
+
+    # Generate tickets in DB
+    db_tickets = []
+    for item in order.items:
+        # Increment sold count in DB
+        item.ticket_type.sold_quantity += item.quantity
+        # Create ticket records
+        for _ in range(item.quantity):
+            t = Ticket(
+                id=uuid.uuid4(),
+                order_id=order.id,
+                ticket_type_id=item.ticket_type_id,
+                qr_code_url=f"tickets/{order.id}.pdf",  # Temporary path
+                used=False,
+            )
+            db.add(t)
+            db_tickets.append(t)
+
+    db.commit()
+
+    # Format order dictionary for email templates and worker
+    order_dict = {
+        "id": str(order.id),
+        "status": order.status,
+        "total_cents": order.total_cents,
+        "items": [
+            {
+                "name": item.ticket_type.name,
+                "unit_price_cents": item.unit_price_cents,
+                "quantity": item.quantity,
+            }
+            for item in order.items
+        ],
+        "tickets": [{"id": str(t.id)} for t in db_tickets],
+    }
 
     try:
-        _send_order_confirmation(order)
+        _send_order_confirmation(order_dict)
     except Exception as e:
         print(f"[ses] order_confirmation FAILED: {e}")
 
     if sqs_client and SQS_QUEUE_URL:
         sqs_client.send_message(
             QueueUrl=SQS_QUEUE_URL,
-            MessageBody=json.dumps({"order": order}),
+            MessageBody=json.dumps({"order": order_dict}),
         )
-        print(f"[order] enqueued {order['id']} on SQS")
+        print(f"[order] enqueued {order.id} on SQS")
     else:
         print("[order] SQS not configured — skipping enqueue")
 
-app = FastAPI(title="Ticket App API (Member D scaffold)")
+
+app = FastAPI(title="Ticket App API (Member B Implementation)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -71,10 +135,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# In-memory stand-ins until Member B's DB lands.
-ORDERS: dict[str, dict] = {}
-PROCESSED_STRIPE_EVENTS: set[str] = set()
 
 
 class OrderItemIn(BaseModel):
@@ -93,46 +153,466 @@ class OrderOut(BaseModel):
     total_cents: int
 
 
+class TicketTypeDto(BaseModel):
+    id: str
+    name: str
+    price_cents: int
+    total_quantity: int
+    sold_quantity: int
+
+
+class EventDto(BaseModel):
+    id: str
+    title: str
+    description: str
+    category: str
+    city: str
+    starts_at: str
+    image_url: str
+    price: float
+    ticket_types: list[TicketTypeDto] = []
+
+
+class CreateEventIn(BaseModel):
+    title: str
+    description: str
+    category: str
+    city: str
+    imageUrl: str
+    date: str
+    price: float
+    capacity: int
+    vipPrice: float = None
+
+
 @app.get("/health")
-def health():
-    return {"status": "ok"}
+def health(db: Session = Depends(get_db)):
+    # Verify DB connection
+    try:
+        db.execute("SELECT 1")
+        db_status = "ok"
+    except Exception:
+        db_status = "error"
+
+    # Verify Redis connection
+    try:
+        redis_client.ping()
+        redis_status = "ok"
+    except Exception:
+        redis_status = "error"
+
+    return {"status": "ok", "db": db_status, "redis": redis_status}
+
+
+@app.get("/events", response_model=list[EventDto])
+def list_events(city: str = None, category: str = None, db: Session = Depends(get_db)):
+    query = db.query(Event).filter(Event.status == "published")
+    if city and city != "All":
+        # Join venue to filter by city
+        query = query.join(Venue).filter(Venue.city.ilike(city.strip()))
+    if category and category != "All":
+        query = query.filter(Event.category.ilike(category.strip()))
+
+    events = query.all()
+
+    result = []
+    for e in events:
+        # Find default or minimum price for the event
+        min_price = 0.0
+        if e.ticket_types:
+            min_price = min(tt.price_cents for tt in e.ticket_types) / 100
+
+        result.append(
+            EventDto(
+                id=str(e.id),
+                title=e.title,
+                description=e.description,
+                category=e.category,
+                city=e.venue.city if e.venue else "Unknown",
+                starts_at=e.starts_at.date().isoformat(),
+                image_url=e.image_url or "",
+                price=min_price,
+            )
+        )
+    return result
+
+
+@app.get("/events/{event_id}", response_model=EventDto)
+def get_event(event_id: str, db: Session = Depends(get_db)):
+    try:
+        event_uuid = uuid.UUID(event_id)
+    except ValueError:
+        raise HTTPException(400, "Invalid event ID format")
+
+    event = db.query(Event).filter(Event.id == event_uuid).first()
+    if not event:
+        raise HTTPException(404, "Event not found")
+
+    min_price = 0.0
+    ticket_types_dto = []
+    for tt in event.ticket_types:
+        ticket_types_dto.append(
+            TicketTypeDto(
+                id=str(tt.id),
+                name=tt.name,
+                price_cents=tt.price_cents,
+                total_quantity=tt.total_quantity,
+                sold_quantity=tt.sold_quantity,
+            )
+        )
+
+    if event.ticket_types:
+        min_price = min(tt.price_cents for tt in event.ticket_types) / 100
+
+    return EventDto(
+        id=str(event.id),
+        title=event.title,
+        description=event.description,
+        category=event.category,
+        city=event.venue.city if event.venue else "Unknown",
+        starts_at=event.starts_at.date().isoformat(),
+        image_url=event.image_url or "",
+        price=min_price,
+        ticket_types=ticket_types_dto,
+    )
 
 
 @app.post("/orders")
-def create_order(payload: CreateOrderIn):
+def create_order(
+    payload: CreateOrderIn,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    items_to_process = []
+    total_cents = 0
+
     order_id = str(uuid.uuid4())
-    items = [item.model_dump() for item in payload.items]
-    total_cents = sum(i["unit_price_cents"] * i["quantity"] for i in items)
 
-    order = {
-        "id": order_id,
-        "status": "pending",
-        "items": items,
-        "total_cents": total_cents,
-        "stripe_session_id": None,
-    }
-    ORDERS[order_id] = order
+    # Map frontend item names (e.g. "Istanbul Jazz Night — General Admission") to seeded ticket types in DB
+    for item in payload.items:
+        event_title = ""
+        ticket_type_name = ""
+        if " — " in item.name:
+            event_title, ticket_type_name = item.name.split(" — ", 1)
+        else:
+            event_title = item.name
+            ticket_type_name = "General Admission"
 
-    session = create_checkout_session(
-        order, os.environ.get("FRONTEND_URL", "http://localhost:5173")
+        # Normalize name for seeding compatibility
+        if "General" in ticket_type_name:
+            ticket_type_name = "General Admission"
+        elif "VIP" in ticket_type_name:
+            ticket_type_name = "VIP Ticket"
+
+        db_event = (
+            db.query(Event).filter(Event.title.ilike(event_title.strip())).first()
+        )
+        if not db_event:
+            raise HTTPException(
+                404, f"Event matching title '{event_title}' not found"
+            )
+
+        db_ticket_type = (
+            db.query(TicketType)
+            .filter(
+                TicketType.event_id == db_event.id,
+                TicketType.name.ilike(ticket_type_name.strip()),
+            )
+            .first()
+        )
+        if not db_ticket_type:
+            raise HTTPException(
+                404,
+                f"Ticket type '{ticket_type_name}' not found for event '{event_title}'",
+            )
+
+        # Acquire lock in Redis
+        success = reserve_tickets(
+            db, str(db_ticket_type.id), item.quantity, order_id
+        )
+        if not success:
+            # Revert any previously acquired locks for this order
+            for prev_tt_id, prev_qty in items_to_process:
+                release_tickets(prev_tt_id, prev_qty, order_id)
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"Not enough tickets available for '{item.name}'",
+            )
+
+        items_to_process.append((str(db_ticket_type.id), item.quantity))
+        total_cents += item.unit_price_cents * item.quantity
+
+    # Create Order and OrderItems in DB
+    try:
+        order = Order(
+            id=uuid.UUID(order_id),
+            user_id=current_user.id,
+            status="pending",
+            total_cents=total_cents,
+            currency="try",
+        )
+        db.add(order)
+        db.commit()
+
+        for tt_id, qty in items_to_process:
+            db_item = OrderItem(
+                id=uuid.uuid4(),
+                order_id=order.id,
+                ticket_type_id=uuid.UUID(tt_id),
+                quantity=qty,
+                unit_price_cents=db.query(TicketType)
+                .filter(TicketType.id == uuid.UUID(tt_id))
+                .first()
+                .price_cents,
+            )
+            db.add(db_item)
+        db.commit()
+
+        # Format order object for Stripe
+        order_stripe_format = {
+            "id": order_id,
+            "items": [
+                {
+                    "name": item.name,
+                    "unit_price_cents": item.unit_price_cents,
+                    "quantity": item.quantity,
+                }
+                for item in payload.items
+            ],
+        }
+
+        session = create_checkout_session(
+            order_stripe_format,
+            os.environ.get("FRONTEND_URL", "http://localhost:5173"),
+        )
+        order.stripe_session_id = session.id
+        db.commit()
+
+        return {"order_id": order_id, "checkout_url": session.url}
+
+    except Exception as e:
+        db.rollback()
+        # Release Redis locks on DB insertion error
+        for tt_id, qty in items_to_process:
+            release_tickets(tt_id, qty, order_id)
+        raise HTTPException(500, f"Failed to create order: {e}")
+
+
+@app.get("/orders/me")
+def get_my_tickets(
+    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    orders = (
+        db.query(Order)
+        .filter(Order.user_id == current_user.id, Order.status == "paid")
+        .all()
     )
-    order["stripe_session_id"] = session.id
 
-    return {"order_id": order_id, "checkout_url": session.url}
+    result = []
+    for o in orders:
+        general_qty = 0
+        vip_qty = 0
+        event_title = "Unknown Event"
+
+        for item in o.items:
+            event_title = item.ticket_type.event.title
+            if "General" in item.ticket_type.name:
+                general_qty += item.quantity
+            elif "VIP" in item.ticket_type.name:
+                vip_qty += item.quantity
+
+        result.append(
+            {
+                "id": str(o.id),
+                "eventTitle": event_title,
+                "generalQuantity": general_qty,
+                "vipQuantity": vip_qty,
+                "total": o.total_cents / 100,
+                "purchasedAt": o.created_at.isoformat() + "Z",
+            }
+        )
+    return result
 
 
 @app.get("/orders/{order_id}", response_model=OrderOut)
-def get_order(order_id: str):
-    order = ORDERS.get(order_id)
+def get_order(order_id: str, db: Session = Depends(get_db)):
+    try:
+        order_uuid = uuid.UUID(order_id)
+    except ValueError:
+        raise HTTPException(400, "Invalid order ID format")
+
+    order = db.query(Order).filter(Order.id == order_uuid).first()
     if not order:
         raise HTTPException(404, "Order not found")
     return OrderOut(
-        id=order["id"], status=order["status"], total_cents=order["total_cents"]
+        id=str(order.id), status=order.status, total_cents=order.total_cents
     )
 
 
+@app.get("/tickets/{ticket_id}")
+def get_ticket_pdf(
+    ticket_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Generates a presigned URL to download the PDF ticket from S3."""
+    try:
+        ticket_uuid = uuid.UUID(ticket_id)
+    except ValueError:
+        raise HTTPException(400, "Invalid ticket ID format")
+
+    # In single user local-dev we might retrieve by order ID too.
+    # Check if a ticket exists with this ID or check if it matches an order ID
+    ticket = db.query(Ticket).filter(Ticket.id == ticket_uuid).first()
+    if not ticket:
+        # Fallback to search if the user provided the order ID (which the frontend MyTickets uses as ticket.id)
+        ticket = db.query(Ticket).filter(Ticket.order_id == ticket_uuid).first()
+        if not ticket:
+            raise HTTPException(404, "Ticket not found")
+
+    # Verify ownership
+    if ticket.order.user_id != current_user.id:
+        raise HTTPException(403, "Not authorized to download this ticket")
+
+    bucket_name = os.environ["TICKETS_BUCKET"]
+    s3_key = f"tickets/{ticket.id}.pdf"
+
+    try:
+        download_url = s3_client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": bucket_name, "Key": s3_key},
+            ExpiresIn=900,
+        )
+        return {"download_url": download_url}
+    except Exception as e:
+        raise HTTPException(500, f"Failed to generate download URL: {e}")
+
+
+@app.post("/admin/events")
+def create_event_admin(
+    payload: CreateEventIn,
+    current_user: User = Depends(require_role(["organizer", "admin"])),
+    db: Session = Depends(get_db),
+):
+    try:
+        # Find or create a default venue in that city
+        venue = (
+            db.query(Venue)
+            .filter(Venue.city.ilike(payload.city.strip()))
+            .first()
+        )
+        if not venue:
+            venue = Venue(
+                id=uuid.uuid4(),
+                name=f"{payload.city} Event Venue",
+                city=payload.city,
+                address=f"Default Address, {payload.city}",
+                capacity=payload.capacity,
+            )
+            db.add(venue)
+            db.commit()
+
+        # Parse date
+        event_date = datetime.datetime.strptime(payload.date, "%Y-%m-%d")
+
+        event = Event(
+            id=uuid.uuid4(),
+            title=payload.title,
+            description=payload.description,
+            category=payload.category,
+            image_url=payload.imageUrl,
+            venue_id=venue.id,
+            organizer_id=current_user.id,
+            starts_at=event_date,
+            ends_at=event_date + datetime.timedelta(hours=3),
+            status="published",
+        )
+        db.add(event)
+        db.commit()
+
+        # Create general ticket type
+        tt_gen = TicketType(
+            id=uuid.uuid4(),
+            event_id=event.id,
+            name="General Admission",
+            price_cents=int(payload.price * 100),
+            currency="try",
+            total_quantity=payload.capacity,
+            sold_quantity=0,
+        )
+        db.add(tt_gen)
+
+        # Create VIP ticket type (double the price or custom vipPrice, 20% of capacity)
+        vip_price_val = payload.vipPrice if (payload.vipPrice is not None and payload.vipPrice > 0) else payload.price * 2
+        tt_vip = TicketType(
+            id=uuid.uuid4(),
+            event_id=event.id,
+            name="VIP Ticket",
+            price_cents=int(vip_price_val * 100),
+            currency="try",
+            total_quantity=max(1, int(payload.capacity * 0.2)),
+            sold_quantity=0,
+        )
+        db.add(tt_vip)
+        db.commit()
+
+        return {"event_id": str(event.id)}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"Failed to create event: {e}")
+
+
+@app.get("/admin/events/{event_id}/sales")
+def get_event_sales_admin(
+    event_id: str,
+    current_user: User = Depends(require_role(["organizer", "admin"])),
+    db: Session = Depends(get_db),
+):
+    try:
+        event_uuid = uuid.UUID(event_id)
+    except ValueError:
+        raise HTTPException(400, "Invalid event ID format")
+
+    event = db.query(Event).filter(Event.id == event_uuid).first()
+    if not event:
+        raise HTTPException(404, "Event not found")
+
+    # Calculate tickets sold and revenue
+    # Query paid orders containing this event's ticket types
+    items = (
+        db.query(OrderItem)
+        .join(Order)
+        .join(TicketType)
+        .filter(
+            TicketType.event_id == event.id,
+            Order.status == "paid",
+        )
+        .all()
+    )
+
+    tickets_sold = sum(item.quantity for item in items)
+    revenue = sum(item.quantity * item.unit_price_cents for item in items) / 100
+
+    # Detail breakdown
+    breakdown = []
+    for tt in event.ticket_types:
+        breakdown.append({
+            "name": tt.name,
+            "total": tt.total_quantity,
+            "sold": tt.sold_quantity,
+            "price": tt.price_cents / 100,
+        })
+
+    return {
+        "event_id": event_id,
+        "tickets_sold": tickets_sold,
+        "revenue": revenue,
+        "breakdown": breakdown,
+    }
+
+
 @app.post("/webhooks/stripe")
-async def stripe_webhook(request: Request):
+async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
     payload = await request.body()
     sig = request.headers.get("stripe-signature")
     try:
@@ -142,15 +622,25 @@ async def stripe_webhook(request: Request):
     except (ValueError, stripe.error.SignatureVerificationError):
         raise HTTPException(400, "Invalid signature")
 
-    if event["id"] in PROCESSED_STRIPE_EVENTS:
+    # Check if duplicate
+    existing_event = (
+        db.query(ProcessedStripeEvent)
+        .filter(ProcessedStripeEvent.event_id == event["id"])
+        .first()
+    )
+    if existing_event:
         return {"received": True, "duplicate": True}
-    PROCESSED_STRIPE_EVENTS.add(event["id"])
+
+    # Save to processed events
+    processed_event = ProcessedStripeEvent(event_id=event["id"])
+    db.add(processed_event)
+    db.commit()
 
     if event["type"] == "checkout.session.completed":
         order_id = event["data"]["object"]["metadata"]["order_id"]
-        order = ORDERS.get(order_id)
+        order = db.query(Order).filter(Order.id == uuid.UUID(order_id)).first()
         if order:
-            _complete_order(order)
+            _complete_order(order, db)
 
     return {"received": True}
 
@@ -161,12 +651,18 @@ async def stripe_webhook(request: Request):
 # avoid testing Stripe's own checkout UI (which Stripe redesigns frequently).
 # ---------------------------------------------------------------------------
 if os.environ.get("TEST_MODE", "").lower() == "true":
+
     @app.post("/test/complete-order/{order_id}")
-    def test_complete_order(order_id: str):
-        order = ORDERS.get(order_id)
+    def test_complete_order(order_id: str, db: Session = Depends(get_db)):
+        try:
+            order_uuid = uuid.UUID(order_id)
+        except ValueError:
+            raise HTTPException(400, "Invalid order ID format")
+
+        order = db.query(Order).filter(Order.id == order_uuid).first()
         if not order:
             raise HTTPException(404, "Order not found")
-        _complete_order(order)
-        return {"order_id": order_id, "status": order["status"]}
+        _complete_order(order, db)
+        return {"order_id": order_id, "status": order.status}
 
     print("[main] TEST_MODE enabled — /test/complete-order/{id} available")

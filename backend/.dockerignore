@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.gitignore
+.env
+tests/
+alembic.ini
+alembic/
+*.db
+.pytest_cache/

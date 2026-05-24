@@ -22,13 +22,17 @@ export default function App() {
           </Link>
 
           <div className="flex items-center gap-4 text-sm">
-            <Link to="/my-tickets" className="text-slate-700 hover:text-slate-900">
-              My Tickets
-            </Link>
+            {(!user || (user.role !== "organizer" && user.role !== "admin" && user.email !== "organizer@example.com")) && (
+              <Link to="/my-tickets" className="text-slate-700 hover:text-slate-900">
+                My Tickets
+              </Link>
+            )}
 
-            <Link to="/admin" className="text-slate-700 hover:text-slate-900">
-              Admin
-            </Link>
+            {user && (user.role === "organizer" || user.role === "admin" || user.email === "organizer@example.com") && (
+              <Link to="/admin" className="text-slate-700 hover:text-slate-900">
+                Admin
+              </Link>
+            )}
 
             {user ? (
               <>

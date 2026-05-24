@@ -1,9 +1,42 @@
+import { useEffect, useState } from "react"
 import { Link, useParams } from "react-router-dom"
-import { getStoredEvents } from "../data/eventStore"
+import { getEvent } from "../api/events"
+import type { EventItem } from "../data/events"
 
 export default function EventDetail() {
   const { id } = useParams()
-  const event = getStoredEvents().find((item) => item.id === id)
+  const [event, setEvent] = useState<EventItem | null>(null)
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    if (!id) return
+    getEvent(id)
+      .then((data: any) => {
+        setEvent({
+          id: data.id,
+          title: data.title,
+          city: data.city,
+          category: data.category,
+          date: data.starts_at,
+          price: data.price,
+          imageUrl: data.image_url,
+          description: data.description,
+        })
+        setLoading(false)
+      })
+      .catch((err) => {
+        console.error(err)
+        setLoading(false)
+      })
+  }, [id])
+
+  if (loading) {
+    return (
+      <main className="mx-auto max-w-4xl px-6 py-10">
+        <p className="text-slate-600">Loading event details...</p>
+      </main>
+    )
+  }
 
   if (!event) {
     return (

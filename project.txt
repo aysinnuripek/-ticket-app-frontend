@@ -1,0 +1,549 @@
+
+Event Ticket Sales Platform
+Complete Development Plan
+A Cloud-Native Web Application Built on AWS
+Tech Stack: Python + FastAPI + React + AWS
+Team Size: 4 Members
+Timeline: 8 Weeks
+
+Table of Contents
+Use the references below to navigate the document. Each numbered section corresponds to a major part of the development plan.
+
+1. Project Overview
+2. Proposed Architecture (High-Level Design)
+3. Tech Stack Summary
+4. Database Schema (ERD)
+5. Team Roles & Task Division
+    5.1 Member A — Cloud Infrastructure & DevOps Lead
+    5.2 Member B — Backend & Database Lead
+    5.3 Member C — Frontend & UX Lead
+    5.4 Member D — Async Services, Payments & Testing Lead
+6. Detailed Implementation Guidelines
+    6.1 Member A — Step-by-Step Guide
+    6.2 Member B — Step-by-Step Guide
+    6.3 Member C — Step-by-Step Guide
+    6.4 Member D — Step-by-Step Guide
+7. 8-Week Timeline
+8. Coordination & Best Practices
+9. Cost Estimate & Resource Cleanup
+10. Glossary
+
+1. Project Overview
+Product. A web application where end users browse upcoming events (concerts, sports, theatre, festivals), view event details, select tickets, pay online with a credit card, and receive a digital ticket containing a QR code via email. Event organizers can create events and view their sales through an admin panel.
+Why this is a strong cloud project. Ticket sales have very spiky traffic patterns: when a popular event goes on sale, hundreds of users hit the system in a few minutes, then the load drops off again. This kind of bursty workload is a perfect excuse to use auto-scaling containers, load balancers, asynchronous queues, in-memory caches, and managed databases — all of which give you concrete, justifiable design decisions for the project report.
+Core user flows.
+	•	Browse events: open the homepage, see a list of upcoming events filtered by city and category.
+	•	View event details: see seat availability, prices, venue info, and event description.
+	•	Purchase: sign in, select seats/tickets, pay via Stripe (test mode), receive an email with a QR code ticket.
+	•	My tickets: view past purchases and re-download the QR code.
+	•	Admin: organizers can create events, set prices, and view sales reports.
+
+2. Proposed Architecture (High-Level Design)
+The architecture follows a standard three-tier pattern (client, application, data) extended with asynchronous workers for slow tasks. Everything runs inside a single AWS Virtual Private Cloud (VPC) spanning two Availability Zones for high availability.
+Layer-by-Layer Breakdown
+Frontend (Client)
+	•	React single-page application built with Vite.
+	•	Hosted on Amazon S3 (static files) and served globally through Amazon CloudFront (CDN) for low latency anywhere in the world.
+Backend (API)
+	•	An Application Load Balancer (ALB) receives HTTPS traffic and distributes it across multiple containers.
+	•	The API runs on Amazon ECS Fargate — serverless containers, so we do not manage EC2 servers.
+	•	Auto-scaling: the number of running containers grows when CPU or request count rises, and shrinks again when traffic drops.
+	•	Built with Python and FastAPI, packaged as a Docker image.
+Data Layer
+	•	Amazon RDS (PostgreSQL) — relational database for users, events, orders, and tickets. Deployed Multi-AZ so a single AZ failure does not bring the system down.
+	•	Amazon ElastiCache (Redis) — used for two things: temporarily locking seats during checkout (10-minute TTL) so two users cannot buy the same seat, and caching the popular event list to reduce database load.
+Async / Spike Handling
+	•	Amazon SQS — when a user successfully pays, the API drops a message on a queue instead of doing the slow work inline. The user gets an instant response.
+	•	AWS Lambda — picks up the queue message, generates the QR code, builds a PDF ticket, uploads it to S3, and sends the confirmation email.
+	•	Amazon SES — sends transactional emails (ticket delivery, order confirmation).
+Authentication
+	•	Amazon Cognito — handles signup, login, password reset, and issues JWT tokens. Saves us from building (and securing) auth from scratch.
+Storage
+	•	Amazon S3 — event banner images and generated QR-code PDF tickets.
+Networking
+	•	A VPC with public subnets (ALB, NAT Gateway) and private subnets (ECS tasks, RDS, ElastiCache).
+	•	Amazon Route 53 for DNS, AWS Certificate Manager (ACM) for free HTTPS certificates.
+Observability & IaC
+	•	Amazon CloudWatch — centralized logs, metrics, and alarms.
+	•	Terraform — everything above is defined as code so it is reproducible and easy to document in the report.
+System-Wide Availability Decisions
+	•	RDS is deployed Multi-AZ: AWS keeps a hot standby in a second Availability Zone.
+	•	ECS tasks are spread across two AZs by the ALB, with a minimum of 2 running tasks at all times.
+	•	CloudFront caches static assets at edge locations, reducing origin load.
+	•	Slow work (emails, PDF generation) is decoupled through SQS so a backed-up worker never blocks user requests.
+	•	Health checks on the ALB automatically remove unhealthy containers and replace them.
+
+Note for the report: in the report, this section should be accompanied by a clear architecture diagram. Use a free tool like draw.io, Lucidchart, or AWS’s own architecture icons to draw one. Show users → CloudFront → ALB → ECS → RDS/Redis, plus the SQS → Lambda → SES side flow.
+
+3. Tech Stack Summary
+All tech choices below have already been agreed: Python with FastAPI for the backend, React for the frontend.
+
+Layer
+Technology
+Reason
+Frontend
+React + Vite + TailwindCSS
+Fast dev experience, easy to deploy as static files to S3.
+Backend
+Python 3.11 + FastAPI
+Async-friendly, auto-generates OpenAPI docs, modern and easy to test.
+Backend server
+Uvicorn (inside Docker)
+ASGI server that pairs with FastAPI.
+DB ORM
+SQLAlchemy 2.0 + Alembic
+Industry-standard ORM and migrations tool for Python.
+DB driver
+psycopg2-binary (or asyncpg)
+Connects FastAPI to PostgreSQL.
+Validation
+Pydantic v2
+Bundled with FastAPI; type-safe request/response models.
+Auth
+Cognito + python-jose
+Cognito issues JWTs; python-jose validates them.
+Cache / locks
+Redis (via redis-py)
+Seat locks with TTL, event list cache.
+Queue client
+boto3
+AWS SDK for Python; used for SQS, S3, SES.
+Container
+Docker
+Required by ECS; consistent dev/prod environment.
+IaC
+Terraform
+Industry standard; reproducible infra.
+CI/CD
+GitHub Actions
+Free for small teams; integrates with ECR + ECS.
+Payments
+Stripe (test mode)
+Safe; no real money; well-documented.
+Lambda runtime
+Python 3.11
+Same language as the API; consistent codebase.
+
+4. Database Schema (ERD)
+Below is the minimum viable schema. Member B is responsible for refining and migrating it. Primary keys are UUIDs.
+
+Tables
+users
+	•	id (UUID, PK)
+	•	cognito_sub (string, unique) — the Cognito user ID.
+	•	email, full_name, role (enum: customer | organizer | admin)
+	•	created_at, updated_at
+venues
+	•	id (UUID, PK)
+	•	name, city, address, capacity
+events
+	•	id (UUID, PK)
+	•	title, description, category, image_url
+	•	venue_id (FK → venues.id)
+	•	organizer_id (FK → users.id)
+	•	starts_at, ends_at, status (draft | published | cancelled)
+	•	created_at, updated_at
+ticket_types
+	•	id (UUID, PK)
+	•	event_id (FK → events.id)
+	•	name (e.g. “General Admission”, “VIP”), price_cents, currency, total_quantity, sold_quantity
+orders
+	•	id (UUID, PK)
+	•	user_id (FK → users.id)
+	•	status (pending | paid | failed | cancelled)
+	•	total_cents, currency, stripe_session_id, created_at
+order_items
+	•	id (UUID, PK)
+	•	order_id (FK → orders.id)
+	•	ticket_type_id (FK → ticket_types.id)
+	•	quantity, unit_price_cents
+tickets
+	•	id (UUID, PK) — used inside the QR code.
+	•	order_id (FK → orders.id)
+	•	ticket_type_id (FK → ticket_types.id)
+	•	qr_code_url (S3 link), used (boolean)
+
+5. Team Roles & Task Division
+Each member owns one vertical slice of the system. Tasks are split so that nobody is stuck on only “boring” infra or only frontend, and there are clear integration points where members must coordinate. Members are referred to as A, B, C, D — the team can map these to real names in the first meeting.
+5.1 Member A — Cloud Infrastructure & DevOps Lead
+Owns: The VPC, networking, container orchestration, CI/CD, Infrastructure as Code, and monitoring.
+Tasks
+	•	VPC & networking setup — public/private subnets across two AZs, Internet Gateway, NAT Gateway, route tables, security groups. This is the foundation everything else lives in.
+	•	ECS Fargate cluster — cluster, task definitions, services, target groups, and the Application Load Balancer. Configure auto-scaling rules (min 2 tasks, max 6, scale on CPU > 60%).
+	•	CI/CD pipeline — GitHub Actions workflow that, on every push to main, builds the Docker image, pushes it to Amazon ECR, and updates the running ECS service. This unblocks Member B from doing manual deploys.
+	•	Terraform codebase — every AWS resource above is defined as Terraform code. This makes the environment reproducible and provides excellent material for the configuration sections of the report.
+	•	CloudWatch monitoring — dashboards for API latency, error rate, DB connections, and ECS task count. Alarms on critical thresholds. Produces real screenshots and numbers for the report.
+	•	Route 53 + ACM — register or use an existing domain, request a free TLS certificate from ACM, and point the domain at CloudFront / ALB.
+5.2 Member B — Backend & Database Lead
+Owns: The FastAPI backend, the PostgreSQL schema, business logic, and the AWS-SDK integrations on the API side.
+Tasks
+	•	Database schema — design the ERD (see Section 4), write SQLAlchemy models, and create Alembic migrations. Member A will deploy the RDS instance; you populate it.
+	•	REST API endpoints — events listing/detail, orders, tickets, admin endpoints. This is the contract Member C builds against.
+	•	Seat / ticket locking with Redis — when a user starts checkout, reserve their tickets in Redis with a 10-minute TTL. If they do not pay in time, the lock expires and the tickets are released.
+	•	SQS producer logic — after a successful Stripe webhook, the API drops a message on SQS instead of generating the QR code and sending the email inline.
+	•	Cognito integration — middleware that validates the Cognito-issued JWT on protected routes and attaches the current user to the request.
+	•	Dockerize the backend — write the Dockerfile so Member A can deploy it to ECR/ECS.
+5.3 Member C — Frontend & UX Lead
+Owns: Everything the user sees and clicks on, from the homepage to the admin panel.
+Tasks
+	•	UI pages — homepage with event list, event detail page, ticket-selection / checkout flow, login/signup, “My tickets” page, and a small admin panel for organizers.
+	•	Auth flow with Cognito — use AWS Amplify's auth library so users can sign up, log in, and reset their password without you writing custom auth code.
+	•	Stripe Checkout integration — the frontend half of the payment flow: call the backend to create a Stripe session, then redirect the user to Stripe's hosted page.
+	•	API client layer — a small fetch / axios wrapper that attaches the JWT to every request and handles errors consistently.
+	•	Deploy to S3 + CloudFront — a build script that runs `npm run build` and syncs the output to S3, then invalidates the CloudFront cache. Coordinate with Member A on the CloudFront distribution.
+	•	Responsive design + basic accessibility — most ticket purchases happen on mobile, so test on small screens early.
+5.4 Member D — Async Services, Payments & Testing Lead
+Owns: The pieces that glue the system together — async workers, payments, testing, and quality.
+Tasks
+	•	Lambda consumer for SQS — Python Lambda that reads a payment-success message, generates a QR code, builds a PDF ticket, uploads it to S3, and triggers an SES email.
+	•	SES email templates — order confirmation, ticket delivery, and password reset emails. For the demo, verify the sender domain or use a sandbox-verified address.
+	•	Stripe backend integration — a webhook endpoint in the FastAPI backend that verifies the signature on incoming Stripe events and turns successful payments into SQS messages.
+	•	End-to-end testing — Playwright tests for the critical user flow: browse → select → pay (Stripe test card) → receive ticket. Run them in CI before each deploy.
+	•	Load testing — use k6 or Locust to simulate 500 concurrent users hitting the event detail page and checkout. Capture numbers and graphs for the report's availability section.
+	•	Security pass — verify that secrets live in AWS Secrets Manager (not in code), that IAM roles follow least privilege, and that no S3 bucket is public except the frontend one.
+
+6. Detailed Implementation Guidelines
+This section gives each member a step-by-step “do this, then that” guide. The goal is to remove ambiguity so each person can pick up their part and start coding immediately. Steps refer to AWS services using their official names so they are easy to look up in the AWS console or in Terraform documentation.
+6.1 Member A — Step-by-Step Guide
+Task A1: VPC & Networking Setup
+Goal: create a VPC where private resources (database, containers) are unreachable from the internet directly.
+	•	Create a VPC with CIDR block 10.0.0.0/16.
+	•	Create 4 subnets across two AZs (e.g. eu-central-1a and eu-central-1b): 2 public (10.0.1.0/24, 10.0.2.0/24) and 2 private (10.0.11.0/24, 10.0.12.0/24).
+	•	Create an Internet Gateway and attach it to the VPC.
+	•	Create a NAT Gateway in one of the public subnets and allocate an Elastic IP for it. This lets private resources reach the internet (for OS updates, calling Stripe, etc.) without being reachable themselves.
+	•	Create route tables: one for the public subnets (default route to the Internet Gateway) and one for the private subnets (default route to the NAT Gateway).
+	•	Create security groups:
+	•	ALB SG — allow inbound 80/443 from the internet.
+	•	ECS SG — allow inbound traffic only from the ALB SG on the app port (e.g. 8000).
+	•	RDS SG — allow inbound 5432 only from the ECS SG.
+	•	Redis SG — allow inbound 6379 only from the ECS SG.
+Deliverable: a Terraform module `infra/network/` that recreates the entire VPC with a single `terraform apply`.
+Task A2: ECS Fargate Cluster
+Goal: have a serverless container platform that runs the FastAPI backend behind a load balancer.
+	•	Create an ECR repository named `ticket-app-backend`. This is where Docker images go.
+	•	Create an ECS cluster of type Fargate. No EC2 instances to manage.
+	•	Define a task definition with: 0.5 vCPU, 1 GB memory, container port 8000, image URL from ECR, environment variables (DB host, Redis host, SQS queue URL, Cognito user pool ID), and an execution role that allows pulling from ECR and writing to CloudWatch Logs.
+	•	Create an Application Load Balancer in the public subnets with an HTTPS listener using the ACM certificate (Task A6).
+	•	Create a target group of type `ip` with health-check path `/health` (Member B will implement this endpoint to return 200 OK).
+	•	Create an ECS service that links the task definition to the target group, running in the private subnets, with desired count = 2.
+	•	Configure auto-scaling on the service: min 2, max 6, target tracking on average CPU > 60%.
+Deliverable: Terraform module `infra/ecs/` and a working URL (the ALB DNS name) that returns 200 on `/health`.
+Task A3: CI/CD Pipeline
+Goal: every push to `main` automatically builds the backend, pushes it to ECR, and rolls out a new ECS deployment.
+	•	Create an IAM user for GitHub Actions with permissions to push to ECR and update the ECS service (or use OIDC for keyless auth, which is the modern approach).
+	•	Add the GitHub Actions secrets: AWS_ROLE_ARN, AWS_REGION, ECR_REPOSITORY, ECS_CLUSTER, ECS_SERVICE.
+	•	Create `.github/workflows/deploy.yml` with steps: checkout → configure AWS credentials → login to ECR → docker build → docker push → `aws ecs update-service --force-new-deployment`.
+	•	Add a pull-request workflow that runs the test suite but does not deploy. Member D will plug E2E tests into this.
+Deliverable: a green pipeline run that visibly deploys a code change to production within ~5 minutes.
+Task A4: Terraform Codebase
+Goal: every AWS resource the project uses is described as code, not clicked together in the console.
+	•	Set up a Terraform project structure: `infra/` with modules `network/`, `ecs/`, `rds/`, `redis/`, `s3/`, `cognito/`, `sqs/`, `lambda/`, `cloudfront/`.
+	•	Use a remote backend (S3 + DynamoDB lock table) so the team shares state safely.
+	•	Tag every resource with `Project=TicketApp` and `Owner=<member-name>` for cost tracking.
+	•	Document each module with a short README explaining inputs, outputs, and intent. These READMEs feed directly into the report.
+Deliverable: running `terraform apply` from a clean state recreates the entire infrastructure.
+Task A5: CloudWatch Monitoring
+Goal: see the system's behavior at a glance and get alerted when something breaks.
+	•	Enable CloudWatch Container Insights on the ECS cluster (one-click setting).
+	•	Create a CloudWatch Dashboard with widgets for: ALB request count, ALB 5xx error rate, ECS CPU utilization, RDS CPU, RDS connection count, SQS queue depth, Lambda invocation count and errors.
+	•	Create alarms: 5xx errors > 1% for 5 minutes, RDS CPU > 80% for 10 minutes, SQS queue depth > 100 for 5 minutes, Lambda errors > 0.
+	•	Send all alarms to an SNS topic and subscribe the team's email addresses.
+Deliverable: screenshots of the dashboard under load (Member D's load test) for the report.
+Task A6: Route 53 + ACM
+	•	Register a cheap domain (~$10/year) or use a subdomain of one a team member already owns.
+	•	Create a hosted zone in Route 53.
+	•	Request a wildcard certificate `*.example.com` via ACM (free). Use DNS validation.
+	•	Create A/AAAA alias records: `api.example.com` → ALB, `www.example.com` → CloudFront.
+6.2 Member B — Step-by-Step Guide
+Task B1: Database Schema
+	•	Install dependencies: `pip install fastapi uvicorn sqlalchemy alembic psycopg2-binary python-dotenv`.
+	•	Create `app/models/` with one file per table (`user.py`, `event.py`, `order.py`, etc.) based on the schema in Section 4.
+	•	Run `alembic init alembic` and configure `env.py` to read the DATABASE_URL from environment variables.
+	•	Generate the first migration: `alembic revision --autogenerate -m 'initial schema'`.
+	•	Test locally with Docker Compose: `docker-compose up postgres` then `alembic upgrade head`.
+	•	Seed the DB with 10 sample events for the frontend team to develop against.
+Deliverable: a runnable local environment + a seed script. Hand the seed script to Member C so they have data to display.
+Task B2: REST API Endpoints
+Build these endpoints in FastAPI. Define Pydantic models for every request/response so the OpenAPI docs at `/docs` are auto-generated and complete.
+
+Public endpoints:
+	•	GET /health — used by the ALB; returns 200 OK.
+	•	GET /events?city=...&category=... — list published events.
+	•	GET /events/{id} — single event with ticket types.
+Authenticated user endpoints:
+	•	POST /orders — body: list of {ticket_type_id, quantity}. Reserves seats in Redis (Task B3), creates a pending Order, returns a Stripe Checkout session URL.
+	•	GET /orders/me — list the current user's orders.
+	•	GET /tickets/{id} — returns ticket detail and the S3 link to the QR PDF (if generated).
+Organizer / admin endpoints:
+	•	POST /admin/events — create an event.
+	•	PUT /admin/events/{id} — update an event.
+	•	GET /admin/events/{id}/sales — sales summary.
+Webhook (called by Stripe, not the user):
+	•	POST /webhooks/stripe — receives Stripe events. Member D will help wire this up.
+Deliverable: OpenAPI spec at /docs. Lock the spec in Week 2 so Member C can build against it with confidence.
+Task B3: Seat / Ticket Locking with Redis
+Problem: two users click “buy” on the last ticket at the same time. Without a lock, both purchases would succeed and one customer gets a refund and a bad experience.
+	•	Install redis-py: `pip install redis`.
+	•	On `POST /orders`, before creating the order, try to acquire a Redis key per ticket_type: `SET lock:ticket_type:{id}:{order_id} 1 NX EX 600` for each unit being reserved. If any SET fails (because someone else already holds the lock), reject the order with HTTP 409.
+	•	Decrement an `available:{ticket_type_id}` counter atomically using `DECRBY`. Reject if it would go below zero (reincrement and return 409).
+	•	If the user pays in time, the webhook handler commits the order to the DB and the locks expire naturally.
+	•	If the user does not pay in time, the locks expire after 10 minutes and the tickets become buyable again.
+Deliverable: a test (with pytest + fakeredis) showing that two concurrent orders for the same last ticket only succeed once.
+Task B4: SQS Producer Logic
+	•	Member A creates an SQS queue called `payment-success`. Get its URL into your environment variables as SQS_QUEUE_URL.
+	•	Install boto3: `pip install boto3`.
+	•	In the Stripe webhook handler, on a `checkout.session.completed` event: update the order status to `paid` in the DB, then call `sqs_client.send_message(QueueUrl=..., MessageBody=json.dumps({'order_id': str(order.id)}))`.
+	•	Use IAM Task Role permissions — do not put AWS keys in the code.
+Deliverable: a test order whose successful payment triggers a visible SQS message.
+Task B5: Cognito Integration
+	•	Member A provisions a Cognito User Pool and App Client; get the User Pool ID and the JWKS URL.
+	•	Install python-jose: `pip install "python-jose[cryptography]"`.
+	•	Create a FastAPI dependency `get_current_user` that: reads the Bearer token from the Authorization header, fetches the JWKS (cache it), verifies the signature and `aud`/`iss` claims, and returns the user from the DB (creating one on first sign-in based on the `sub` claim).
+	•	Apply the dependency to every authenticated route. Organizer routes also check `role == 'organizer'` or `'admin'`.
+Deliverable: an authenticated `GET /me` endpoint that returns the user's profile when given a Cognito JWT.
+Task B6: Dockerize the Backend
+Sample multi-stage Dockerfile to copy:
+FROM python:3.11-slim AS base
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+EXPOSE 8000
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+	•	Add a `.dockerignore` (exclude .venv, __pycache__, .git, tests).
+	•	Test locally: `docker build -t ticket-app . && docker run -p 8000:8000 ticket-app`. Verify `/health` returns 200.
+	•	Hand off to Member A: the image name and the port (8000).
+6.3 Member C — Step-by-Step Guide
+Task C1: UI Pages
+	•	Scaffold the project: `npm create vite@latest frontend -- --template react-ts`, then install TailwindCSS following its Vite guide.
+	•	Set up React Router: routes for `/`, `/events/:id`, `/checkout`, `/login`, `/signup`, `/my-tickets`, `/admin`.
+	•	Build pages in this order: Home (event grid) → Event Detail → Checkout → My Tickets → Auth pages → Admin.
+	•	Use mock data from a local JSON file in Week 2–3 while the backend is being built. Switch to the real API in Week 4.
+	•	Keep components small (under 150 lines each); use a `components/` folder for reusable items (EventCard, TicketTypeRow, PriceTotal).
+	•	Don't try to invent a unique design — pick a clean Tailwind UI kit or copy a layout you like from a real ticket site (eventbrite, dice.fm) and adapt it.
+Task C2: Auth Flow with Cognito
+	•	Install Amplify Auth: `npm install aws-amplify`.
+	•	Get the Cognito User Pool ID, App Client ID, and Region from Member A and put them in `src/amplifyconfig.ts`.
+	•	Wrap your app in an AuthProvider that exposes `user`, `signIn`, `signUp`, `signOut`, and `idToken`.
+	•	Build a Login page and a Signup page that call Amplify's `Auth.signIn` / `Auth.signUp`. Handle email confirmation codes.
+	•	Protect routes (e.g. `/checkout`, `/my-tickets`) with a `<RequireAuth>` wrapper that redirects to `/login` if there is no token.
+Task C3: Stripe Checkout Integration
+	•	On the Checkout page, when the user clicks “Pay”, call `POST /orders` on the backend with the selected tickets.
+	•	The backend returns a Stripe Checkout session URL.
+	•	`window.location.href = response.checkout_url;` — Stripe handles the rest. Stripe redirects the user to `/checkout/success` or `/checkout/cancel` on the frontend after payment.
+	•	On the success page, poll `GET /orders/{id}` every 2 seconds until status is `paid`, then show “Ticket sent to your email!”.
+	•	Use Stripe test card 4242 4242 4242 4242 in the demo.
+Task C4: API Client Layer
+	•	Create `src/api/client.ts` exporting a single axios instance with the API base URL.
+	•	Add an interceptor that, before every request, attaches `Authorization: Bearer <idToken>` if the user is signed in.
+	•	Add a response interceptor that, on 401, calls `signOut()` and redirects to login.
+	•	Wrap each backend endpoint in a typed function: `getEvents()`, `getEvent(id)`, `createOrder(payload)`, `getMyTickets()`. This keeps API calls out of components.
+Task C5: Deploy to S3 + CloudFront
+	•	Member A creates the S3 bucket (e.g. `ticket-app-frontend`) and a CloudFront distribution pointing at it. Get the distribution ID.
+	•	Build the app: `npm run build` — output goes to `dist/`.
+	•	Deploy: `aws s3 sync dist/ s3://ticket-app-frontend --delete` then `aws cloudfront create-invalidation --distribution-id <ID> --paths "/*"`.
+	•	Put both commands in `.github/workflows/deploy-frontend.yml` so pushes to `main` deploy automatically.
+	•	Add a `_redirects` file or a CloudFront function so React Router's client-side routes (`/events/123`) do not return 404.
+Task C6: Responsive Design & Accessibility
+	•	Design mobile-first. Test every page at 375px width (iPhone SE) before checking desktop.
+	•	All buttons must have visible focus rings and aria-labels.
+	•	Run Lighthouse on every page; aim for accessibility score ≥ 90.
+	•	Verify color contrast on prices and CTAs (Tailwind's gray-500 on white is below WCAG AA — use gray-700).
+6.4 Member D — Step-by-Step Guide
+Task D1: Lambda Consumer for SQS
+	•	Create a Python 3.11 Lambda function called `process-payment`.
+	•	Configure SQS as the event source (Member A wires this in Terraform).
+	•	Lambda environment variables: DATABASE_URL (read-only is fine), TICKETS_BUCKET, SES_FROM_ADDRESS.
+	•	Function logic in pseudocode:
+for record in event['Records']:
+    order_id = json.loads(record['body'])['order_id']
+    order = fetch_order(order_id)
+    for ticket in order.tickets:
+        qr_png = generate_qr(ticket.id)        # using 'qrcode' library
+        pdf = build_pdf(ticket, qr_png)          # using 'reportlab'
+        s3.put_object(Bucket=..., Key=f'tickets/{ticket.id}.pdf', Body=pdf)
+    send_ses_email(order.user.email, tickets=order.tickets)
+	•	Build dependencies as a Lambda Layer (zip + upload) since `reportlab` is too large to bundle inline.
+	•	Set the Lambda role to allow: read SQS, write S3 (only the tickets bucket), send SES, read RDS (via VPC config).
+	•	Test by sending a fake message to the queue.
+Deliverable: a PDF ticket with QR code arriving in the test inbox within 30 seconds of payment.
+Task D2: SES Email Templates
+	•	Verify the sender email address (or domain) in SES.
+	•	If your account is in the SES sandbox, also verify each recipient address you plan to demo with.
+	•	Create three HTML templates: `order_confirmation`, `ticket_delivery` (with PDF attachment), `password_reset` (handled by Cognito by default — only build if you need custom branding).
+	•	Keep templates simple: a centered logo, a heading, the order summary, a CTA button to “View my tickets”.
+	•	Test rendering in Gmail, Outlook web, and Apple Mail (they each render HTML differently).
+Task D3: Stripe Backend Integration
+	•	Create a Stripe account (free) and grab the test mode publishable key + secret key. Put the secret in AWS Secrets Manager; share only the publishable key with Member C.
+	•	On `POST /orders` (this code lives in Member B's backend, but you'll write the Stripe portion), call `stripe.checkout.Session.create(...)` with the line items and your success/cancel URLs.
+	•	Save the `session.id` on the order row so the webhook can look it up later.
+	•	Implement `POST /webhooks/stripe`: read the raw body, call `stripe.Webhook.construct_event(payload, sig_header, webhook_secret)`. On `checkout.session.completed`, mark the order paid and trigger the SQS message (Task B4).
+	•	Use Stripe CLI in dev to forward webhooks to localhost: `stripe listen --forward-to localhost:8000/webhooks/stripe`.
+Task D4: End-to-End Testing
+	•	Install Playwright: `npm init playwright@latest` inside `frontend/`.
+	•	Write one comprehensive happy-path test: visit homepage → click an event → select 2 GA tickets → sign in (or sign up with a fresh email) → pay with Stripe test card → land on success page → see ticket in My Tickets.
+	•	Add 3–5 smaller tests: invalid login, viewing My Tickets while signed out (should redirect), trying to buy more tickets than available.
+	•	Run tests in GitHub Actions (Member A's PR workflow) against a deployed staging URL, not localhost.
+Task D5: Load Testing
+	•	Install k6 locally (`brew install k6` or download from k6.io).
+	•	Write `loadtest/browse.js`: ramp up to 500 virtual users over 2 minutes, each repeatedly hitting `GET /events` and `GET /events/{id}`.
+	•	Write `loadtest/checkout.js`: 50 virtual users running the full purchase flow. (Use Stripe test mode — no real charges.)
+	•	Run both tests against the deployed staging environment.
+	•	Capture: p95 response time, error rate, ECS task count over time (from CloudWatch), RDS CPU. These numbers and graphs are gold for the High Level Design / availability section of the report.
+Task D6: Security Pass
+	•	Audit IAM roles: every ECS task role and Lambda role should have the minimum permissions to do its job. No `*:*`.
+	•	Confirm all secrets (Stripe keys, DB password) are in AWS Secrets Manager or SSM Parameter Store, never committed.
+	•	Confirm the RDS security group only allows traffic from the ECS security group.
+	•	Confirm only the frontend S3 bucket is publicly readable; tickets bucket must be private with signed URLs.
+	•	Run `npm audit` and `pip-audit`; fix any high or critical CVEs.
+	•	Enable AWS GuardDuty (free trial) for 7 days during the demo period — cheap and impressive in the report.
+
+7. 8-Week Timeline
+This timeline assumes ~10–15 hours per person per week. Adjust as needed. Anything not started by the end of Week 5 is a serious risk to the final demo.
+
+Week
+Focus
+Key Deliverables
+1
+Planning & Setup
+Tech stack confirmed, AWS accounts ready, repo created, ERD drafted, Figma wireframes for Home and Checkout pages.
+2
+Foundation
+VPC + RDS running (A). DB schema deployed (B). React skeleton with routing (C). Lambda hello-world (D).
+3
+Core Backend + Frontend
+Event listing & detail endpoints (B). ECS deploying via CI/CD (A). Event list & detail UI with mock data (C). SES verified + first email template (D).
+4
+Auth & Checkout
+Cognito wired up end to end (B + C). Seat selection UI (C). Stripe sandbox session creation working (B + D).
+5
+Async Flow Working
+SQS + Lambda + SES pipeline end-to-end (B + D). Redis seat locks (B). Admin panel skeleton (C). CloudWatch dashboard live (A).
+6
+Integration & Bug Fixes
+Full purchase flow works end-to-end on the deployed environment. Everyone fixes their slice.
+7
+Testing & Hardening
+Playwright E2E tests passing (D). Load test results captured (D). Multi-AZ RDS failover manually tested (A). Security pass complete (D).
+8
+Report + Demo Prep
+Report written following the template. Demo recorded. Presentation slides prepared.
+
+8. Coordination & Best Practices
+Communication
+	•	Weekly 30-minute sync — same day every week. Each person reports: what I did, what I will do, what is blocking me.
+	•	Shared Notion / Trello / GitHub Projects board with columns: Backlog, In Progress, Blocked, Review, Done.
+	•	A `#project` channel on Slack or Discord for quick questions — do not wait until the weekly sync.
+Git Workflow
+	•	One repository, with two top-level folders: `backend/` (Member B + D) and `frontend/` (Member C). Member A's `infra/` folder lives at the root.
+	•	Feature branches: `feat/event-list`, `fix/login-error`. Never push directly to `main`.
+	•	Pull requests require at least one approving review. Member A's PRs get reviewed by Member B; Member C and D review each other.
+	•	Squash-merge into main.
+API Contract First
+	•	Member B publishes the OpenAPI spec in Week 2 and pins it. Changes after Week 4 must be communicated explicitly in the team channel.
+	•	Member C develops against mock JSON in Week 2–3 to avoid being blocked while the backend is built.
+Documentation Habits
+	•	Every member keeps a running personal log of “what I chose and why” in their own markdown file.
+	•	Take screenshots of AWS console configurations as you go — they are gold for the configuration sections of the report.
+	•	Commit messages should describe the WHY, not just the WHAT.
+Cost Hygiene
+	•	Tag every AWS resource with `Project=TicketApp` and view the AWS Cost Explorer filtered on that tag weekly.
+	•	Stop ECS services and the NAT Gateway overnight (they are the biggest cost) using a scheduled Lambda or just manually.
+	•	Delete the entire stack via `terraform destroy` after the project is graded — do not leave it running.
+
+9. Cost Estimate & Resource Cleanup
+Approximate monthly cost if you run everything 24/7 for one month in eu-central-1 (Frankfurt):
+
+Service
+Approx. Cost / Month
+Notes
+RDS db.t3.micro Multi-AZ
+$30
+Single-AZ during dev (~$15) is fine; switch to Multi-AZ for the demo only.
+ECS Fargate (2 tasks)
+$25
+0.5 vCPU + 1 GB each, 24/7.
+ElastiCache cache.t3.micro
+$15
+Smallest available.
+NAT Gateway
+$32
+Biggest single line item. Delete when not actively developing.
+ALB
+$18
+Plus data charges.
+CloudFront + S3
+<$1
+Negligible at student scale.
+Lambda + SQS + SES
+<$1
+Free tier covers all of this.
+Cognito
+$0
+Free up to 50,000 MAUs.
+Route 53
+$0.50
+Per hosted zone.
+Total (running 24/7)
+~$120
+Realistic if you run it for the full month with Multi-AZ.
+Realistic project total
+$30 – $80
+If you stop the NAT and RDS outside of work hours.
+Final cleanup checklist
+	•	Run `terraform destroy` from the `infra/` folder.
+	•	Manually delete: any S3 buckets that contain objects (Terraform refuses to delete non-empty buckets), the ECR repository if it holds images, CloudWatch log groups (optional).
+	•	Confirm AWS Cost Explorer shows zero charges in the days after cleanup.
+
+10. Glossary
+Quick definitions for the AWS services and other tools mentioned in this plan, in case anyone in the team is new to them.
+
+Term
+Meaning
+ACM
+AWS Certificate Manager. Issues free TLS/SSL certificates for HTTPS.
+ALB
+Application Load Balancer. Distributes HTTP/HTTPS traffic across multiple containers.
+Alembic
+Database migrations tool for SQLAlchemy.
+Amplify
+AWS frontend library; commonly used here only for its Cognito auth helpers.
+AZ
+Availability Zone. A physically isolated datacenter within an AWS Region.
+CDN
+Content Delivery Network. Caches static assets close to the user.
+CloudFront
+AWS’s CDN.
+CloudWatch
+AWS’s observability service: logs, metrics, alarms, dashboards.
+Cognito
+AWS’s managed user-identity service (signup, login, JWTs).
+ECR
+Elastic Container Registry. AWS’s Docker image registry.
+ECS
+Elastic Container Service. Runs Docker containers; Fargate is its serverless mode.
+FastAPI
+Modern, fast Python web framework with built-in OpenAPI docs.
+IaC
+Infrastructure as Code. Defining infra in version-controlled files (Terraform).
+JWT
+JSON Web Token. Signed user-identity token returned by Cognito.
+Lambda
+AWS’s serverless function service. Pay only for invocations.
+NAT Gateway
+Lets private-subnet resources reach the internet without being reachable.
+RDS
+Relational Database Service. AWS-managed PostgreSQL / MySQL / etc.
+Redis
+In-memory key/value store. Used here for seat locks and caching.
+SES
+Simple Email Service. AWS’s transactional email sender.
+SQS
+Simple Queue Service. AWS’s managed message queue.
+TLS
+Transport Layer Security. The protocol behind HTTPS.
+VPC
+Virtual Private Cloud. Your isolated network on AWS.
+
+
+Good luck — build something you’d actually want to use, and the report writes itself.
