@@ -65,7 +65,7 @@ export default function MyTickets() {
     <main className="mx-auto max-w-4xl px-6 py-10">
       <h1 className="text-3xl font-bold text-slate-900">My Tickets</h1>
       <p className="mt-3 text-slate-600">
-        Your purchased demo tickets appear here.
+        Your purchased tickets appear here.
       </p>
 
       {tickets.length === 0 ? (
@@ -118,7 +118,7 @@ export default function MyTickets() {
                   <TicketQRCode value={ticket.id} />
 
                   <p className="mt-3 text-xs font-semibold text-slate-500">
-                    Demo QR Code
+                    Ticket QR Code
                   </p>
 
                   <button
