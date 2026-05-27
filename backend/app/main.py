@@ -14,6 +14,7 @@ from reportlab.lib.units import cm
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
 from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -495,37 +496,41 @@ def get_ticket_pdf(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Generates a presigned URL to download the PDF ticket from S3."""
+    """Generates the PDF ticket on the fly and streams it directly to the browser."""
     try:
         ticket_uuid = uuid.UUID(ticket_id)
     except ValueError:
         raise HTTPException(400, "Invalid ticket ID format")
 
-    # In single user local-dev we might retrieve by order ID too.
-    # Check if a ticket exists with this ID or check if it matches an order ID
     ticket = db.query(Ticket).filter(Ticket.id == ticket_uuid).first()
     if not ticket:
-        # Fallback to search if the user provided the order ID (which the frontend MyTickets uses as ticket.id)
         ticket = db.query(Ticket).filter(Ticket.order_id == ticket_uuid).first()
         if not ticket:
             raise HTTPException(404, "Ticket not found")
 
-    # Verify ownership
     if ticket.order.user_id != current_user.id:
         raise HTTPException(403, "Not authorized to download this ticket")
 
-    bucket_name = os.environ["TICKETS_BUCKET"]
-    s3_key = f"tickets/{ticket.id}.pdf"
+    order = ticket.order
+    order_dict = {
+        "id": str(order.id),
+        "total_cents": order.total_cents,
+        "items": [
+            {
+                "name": item.ticket_type.name,
+                "unit_price_cents": item.unit_price_cents,
+                "quantity": item.quantity,
+            }
+            for item in order.items
+        ],
+    }
 
-    try:
-        download_url = s3_client.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": bucket_name, "Key": s3_key},
-            ExpiresIn=900,
-        )
-        return {"download_url": download_url}
-    except Exception as e:
-        raise HTTPException(500, f"Failed to generate download URL: {e}")
+    pdf_bytes = _build_pdf(str(ticket.id), order_dict)
+    return StreamingResponse(
+        io.BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=ticket-{str(ticket.id)[:8]}.pdf"},
+    )
 
 
 @app.post("/admin/events")

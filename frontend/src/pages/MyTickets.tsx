@@ -34,11 +34,16 @@ export default function MyTickets() {
 
   async function handleDownload(orderId: string) {
     try {
-      const res = await apiClient.get<{ download_url: string }>(`/tickets/${orderId}`)
-      window.open(res.data.download_url, "_blank")
+      const res = await apiClient.get(`/tickets/${orderId}`, { responseType: "blob" })
+      const url = window.URL.createObjectURL(new Blob([res.data], { type: "application/pdf" }))
+      const a = document.createElement("a")
+      a.href = url
+      a.download = `ticket-${orderId.slice(0, 8)}.pdf`
+      a.click()
+      window.URL.revokeObjectURL(url)
     } catch (err) {
       console.error(err)
-      alert("Failed to download PDF ticket. Make sure the SQS worker generated it.")
+      alert("Failed to download PDF ticket. Please try again in a few seconds.")
     }
   }
 
