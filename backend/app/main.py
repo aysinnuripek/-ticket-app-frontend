@@ -1,12 +1,18 @@
 import datetime
+import io
 import json
 import os
 import uuid
 from typing import Literal
 
 import boto3
+import qrcode
 import stripe
 from dotenv import load_dotenv
+from reportlab.lib.pagesizes import A5
+from reportlab.lib.units import cm
+from reportlab.lib.utils import ImageReader
+from reportlab.pdfgen import canvas
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -67,8 +73,39 @@ def _send_order_confirmation(order_dict: dict) -> None:
     print(f"[ses] order_confirmation sent for {order_dict['id']}")
 
 
+def _build_pdf(ticket_id: str, order_dict: dict) -> bytes:
+    qr_img = qrcode.make(ticket_id)
+    qr_buf = io.BytesIO()
+    qr_img.save(qr_buf, format="PNG")
+    qr_buf.seek(0)
+
+    pdf_buf = io.BytesIO()
+    c = canvas.Canvas(pdf_buf, pagesize=A5)
+    width, height = A5
+
+    c.setFont("Helvetica-Bold", 22)
+    c.drawString(2 * cm, height - 3 * cm, "TicketApp")
+    c.setFont("Helvetica", 11)
+    c.drawString(2 * cm, height - 4 * cm, f"Ticket {ticket_id}")
+    c.drawString(2 * cm, height - 5 * cm, f"Order {order_dict['id']}")
+    c.drawString(2 * cm, height - 6 * cm, f"Total: {order_dict['total_cents'] / 100:.2f} TRY")
+
+    y = height - 8 * cm
+    c.setFont("Helvetica-Bold", 13)
+    c.drawString(2 * cm, y, "Items:")
+    c.setFont("Helvetica", 11)
+    for item in order_dict.get("items", []):
+        y -= 0.7 * cm
+        c.drawString(2 * cm, y, f"  {item['quantity']} × {item['name']} — {item['unit_price_cents'] / 100:.2f} TRY")
+
+    c.drawImage(ImageReader(qr_buf), width - 7 * cm, 2 * cm, width=5 * cm, height=5 * cm, preserveAspectRatio=True)
+    c.showPage()
+    c.save()
+    return pdf_buf.getvalue()
+
+
 def _complete_order(order: Order, db: Session) -> None:
-    """Idempotent post-payment work: mark paid, email confirmation, enqueue SQS."""
+    """Idempotent post-payment work: mark paid, generate PDFs, upload to S3, send email."""
     if order.status == "paid":
         return
 
@@ -76,26 +113,7 @@ def _complete_order(order: Order, db: Session) -> None:
     db.commit()
     print(f"[order] {order.id} marked paid in DB")
 
-    # Generate tickets in DB
-    db_tickets = []
-    for item in order.items:
-        # Increment sold count in DB
-        item.ticket_type.sold_quantity += item.quantity
-        # Create ticket records
-        for _ in range(item.quantity):
-            t = Ticket(
-                id=uuid.uuid4(),
-                order_id=order.id,
-                ticket_type_id=item.ticket_type_id,
-                qr_code_url=f"tickets/{order.id}.pdf",  # Temporary path
-                used=False,
-            )
-            db.add(t)
-            db_tickets.append(t)
-
-    db.commit()
-
-    # Format order dictionary for email templates and worker
+    # Format order dict for PDF and email
     order_dict = {
         "id": str(order.id),
         "status": order.status,
@@ -108,22 +126,44 @@ def _complete_order(order: Order, db: Session) -> None:
             }
             for item in order.items
         ],
-        "tickets": [{"id": str(t.id)} for t in db_tickets],
     }
+
+    # Generate tickets in DB and build PDFs directly
+    bucket = os.environ.get("TICKETS_BUCKET")
+    db_tickets = []
+    for item in order.items:
+        item.ticket_type.sold_quantity += item.quantity
+        for _ in range(item.quantity):
+            ticket_id = str(uuid.uuid4())
+            s3_key = f"tickets/{ticket_id}.pdf"
+
+            # Upload PDF to S3 if bucket is configured
+            if bucket:
+                try:
+                    pdf_bytes = _build_pdf(ticket_id, order_dict)
+                    s3_client.put_object(
+                        Bucket=bucket, Key=s3_key, Body=pdf_bytes, ContentType="application/pdf"
+                    )
+                    print(f"[pdf] uploaded {s3_key}")
+                except Exception as e:
+                    print(f"[pdf] upload FAILED for {ticket_id}: {e}")
+
+            t = Ticket(
+                id=uuid.UUID(ticket_id),
+                order_id=order.id,
+                ticket_type_id=item.ticket_type_id,
+                qr_code_url=s3_key,
+                used=False,
+            )
+            db.add(t)
+            db_tickets.append(t)
+
+    db.commit()
 
     try:
         _send_order_confirmation(order_dict)
     except Exception as e:
         print(f"[ses] order_confirmation FAILED: {e}")
-
-    if sqs_client and SQS_QUEUE_URL:
-        sqs_client.send_message(
-            QueueUrl=SQS_QUEUE_URL,
-            MessageBody=json.dumps({"order": order_dict}),
-        )
-        print(f"[order] enqueued {order.id} on SQS")
-    else:
-        print("[order] SQS not configured — skipping enqueue")
 
 
 app = FastAPI(title="Ticket App API (Member B Implementation)")
